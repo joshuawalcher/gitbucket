@@ -131,6 +131,23 @@ trait ActivityService {
       currentDate
     )
 
+  def recordReopenPullRequestActivity(
+    userName: String,
+    repositoryName: String,
+    activityUserName: String,
+    issueId: Int,
+    title: String
+  )(implicit s: Session): Unit =
+    Activities insert Activity(
+      userName,
+      repositoryName,
+      activityUserName,
+      "reopen_issue",
+      s"[user:${activityUserName}] reopened pull request [issue:${userName}/${repositoryName}#${issueId}]",
+      Some(title),
+      currentDate
+    )
+
   def recordCommentIssueActivity(
     userName: String,
     repositoryName: String,
@@ -352,15 +369,19 @@ trait ActivityService {
       currentDate
     )
 
-  def recordReleaseActivity(userName: String, repositoryName: String, activityUserName: String, name: String)(
-    implicit s: Session
-  ): Unit =
+  def recordReleaseActivity(
+    userName: String,
+    repositoryName: String,
+    activityUserName: String,
+    releaseName: String,
+    tagName: String
+  )(implicit s: Session): Unit =
     Activities insert Activity(
       userName,
       repositoryName,
       activityUserName,
       "release",
-      s"[user:${activityUserName}] released ${name} at [repo:${userName}/${repositoryName}]",
+      s"[user:${activityUserName}] released [release:${userName}/${repositoryName}/${tagName}:${releaseName}] at [repo:${userName}/${repositoryName}]",
       None,
       currentDate
     )

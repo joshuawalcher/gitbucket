@@ -39,7 +39,10 @@ trait HandleCommentService {
                   ))
               case "reopen" if (issue.closed) =>
                 false ->
-                  (Some("reopen") -> Some(recordReopenIssueActivity _))
+                  (Some("reopen") -> Some(
+                    if (issue.isPullRequest) recordReopenPullRequestActivity _
+                    else recordReopenIssueActivity _
+                  ))
             }
             .map {
               case (closed, t) =>
@@ -80,16 +83,17 @@ trait HandleCommentService {
 
           // call web hooks
           action match {
-            case None => commentId foreach (callIssueCommentWebHook(repository, issue, _, loginAccount))
+            case None =>
+              commentId foreach (callIssueCommentWebHook(repository, issue, _, loginAccount, context.settings))
             case Some(act) =>
               val webHookAction = act match {
                 case "close"  => "closed"
                 case "reopen" => "reopened"
               }
               if (issue.isPullRequest)
-                callPullRequestWebHook(webHookAction, repository, issue.issueId, context.baseUrl, loginAccount)
+                callPullRequestWebHook(webHookAction, repository, issue.issueId, loginAccount, context.settings)
               else
-                callIssuesWebHook(webHookAction, repository, issue, context.baseUrl, loginAccount)
+                callIssuesWebHook(webHookAction, repository, issue, loginAccount, context.settings)
           }
 
           // call hooks

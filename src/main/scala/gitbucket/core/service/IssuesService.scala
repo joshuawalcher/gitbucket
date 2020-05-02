@@ -203,7 +203,7 @@ trait IssuesService {
   }
 
   /**
-   * Returns the search result against  issues.
+   * Returns the search result against issues.
    *
    * @param condition the search condition
    * @param pullRequest if true then returns only pull requests, false then returns only issues.
@@ -265,17 +265,19 @@ trait IssuesService {
   }
 
   /** for api
-   * @return (issue, issueUser, commentCount)
+   * @return (issue, issueUser, assignedUser)
    */
   def searchIssueByApi(condition: IssueSearchCondition, offset: Int, limit: Int, repos: (String, String)*)(
     implicit s: Session
-  ): List[(Issue, Account)] = {
+  ): List[(Issue, Account, Option[Account])] = {
     // get issues and comment count and labels
     searchIssueQueryBase(condition, false, offset, limit, repos)
       .join(Accounts)
       .on { case t1 ~ t2 ~ i ~ t3 => t3.userName === t1.openedUserName }
-      .sortBy { case t1 ~ t2 ~ i ~ t3 => i asc }
-      .map { case t1 ~ t2 ~ i ~ t3 => (t1, t3) }
+      .joinLeft(Accounts)
+      .on { case t1 ~ t2 ~ i ~ t3 ~ t4 => t4.userName === t1.assignedUserName }
+      .sortBy { case t1 ~ t2 ~ i ~ t3 ~ t4 => i asc }
+      .map { case t1 ~ t2 ~ i ~ t3 ~ t4 => (t1, t3, t4) }
       .list
   }
 
@@ -475,6 +477,25 @@ trait IssuesService {
     IssueLabels filter (_.byPrimaryKey(owner, repository, issueId, labelId)) delete
   }
 
+  def deleteAllIssueLabels(owner: String, repository: String, issueId: Int, insertComment: Boolean = false)(
+    implicit context: Context,
+    s: Session
+  ): Int = {
+    if (insertComment) {
+      IssueComments insert IssueComment(
+        userName = owner,
+        repositoryName = repository,
+        issueId = issueId,
+        action = "delete_label",
+        commentedUserName = context.loginAccount.map(_.userName).getOrElse("Unknown user"),
+        content = "All labels",
+        registeredDate = currentDate,
+        updatedDate = currentDate
+      )
+    }
+    IssueLabels filter (_.byIssue(owner, repository, issueId)) delete
+  }
+
   def createComment(
     owner: String,
     repository: String,
@@ -505,6 +526,15 @@ trait IssuesService {
         (t.title, t.content.?, t.updatedDate)
       }
       .update(title, content, currentDate)
+  }
+
+  def changeIssueToPullRequest(owner: String, repository: String, issueId: Int)(implicit s: Session) = {
+    Issues
+      .filter(_.byPrimaryKey(owner, repository, issueId))
+      .map { t =>
+        t.pullRequest
+      }
+      .update(true)
   }
 
   def updateAssignedUserName(
@@ -724,7 +754,7 @@ trait IssuesService {
     implicit s: Session
   ): Unit = {
     extractIssueId(message).foreach { issueId =>
-      val content = fromIssue.issueId + ":" + fromIssue.title
+      val content = s"${fromIssue.issueId}:${fromIssue.title}"
       if (getIssue(owner, repository, issueId).isDefined) {
         // Not add if refer comment already exist.
         if (!getComments(owner, repository, issueId.toInt).exists { x =>
@@ -880,13 +910,9 @@ object IssuesService {
         param(request, "groups").map(_.split(",").toSet).getOrElse(Set.empty)
       )
 
-    def page(request: HttpServletRequest) =
-      try {
-        val i = param(request, "page").getOrElse("1").toInt
-        if (i <= 0) 1 else i
-      } catch {
-        case e: NumberFormatException => 1
-      }
+    def page(request: HttpServletRequest) = {
+      PaginationHelper.page(param(request, "page"))
+    }
   }
 
   case class CommitStatusInfo(

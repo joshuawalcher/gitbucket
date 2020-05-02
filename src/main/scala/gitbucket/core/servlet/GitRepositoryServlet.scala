@@ -4,9 +4,10 @@ import java.io.File
 import java.util
 import java.util.Date
 
+import scala.util.Using
+
 import gitbucket.core.api
 import gitbucket.core.model.WebHook
-import gitbucket.core.model.Profile.profile.blockingApi._
 import gitbucket.core.plugin.{GitRepositoryRouting, PluginRegistry}
 import gitbucket.core.service.IssuesService.IssueSearchCondition
 import gitbucket.core.service.WebHookService._
@@ -14,6 +15,11 @@ import gitbucket.core.service._
 import gitbucket.core.util.SyntaxSugars._
 import gitbucket.core.util.Implicits._
 import gitbucket.core.util._
+import gitbucket.core.model.Profile.profile.blockingApi._
+// Imported names have higher precedence than names, defined in other files.
+// If Database is not bound by explicit import, then "Database" refers to the Database introduced by the wildcard import above.
+import gitbucket.core.servlet.Database
+
 import org.eclipse.jgit.api.Git
 import org.eclipse.jgit.http.server.GitServlet
 import org.eclipse.jgit.lib._
@@ -22,8 +28,8 @@ import org.eclipse.jgit.transport.resolver._
 import org.slf4j.LoggerFactory
 import javax.servlet.ServletConfig
 import javax.servlet.http.{HttpServletRequest, HttpServletResponse}
-
 import org.eclipse.jgit.diff.DiffEntry.ChangeType
+import org.eclipse.jgit.internal.storage.file.FileRepository
 import org.json4s.jackson.Serialization._
 
 /**
@@ -41,7 +47,7 @@ class GitRepositoryServlet extends GitServlet with SystemSettingsService {
     setReceivePackFactory(new GitBucketReceivePackFactory())
 
     val root: File = new File(Directory.RepositoryHome)
-    setRepositoryResolver(new GitBucketRepositoryResolver(new FileResolver[HttpServletRequest](root, true)))
+    setRepositoryResolver(new GitBucketRepositoryResolver)
 
     super.init(config)
   }
@@ -55,11 +61,24 @@ class GitRepositoryServlet extends GitServlet with SystemSettingsService {
       res.sendRedirect(baseUrl(req) + "/" + paths.dropRight(1).last + "/" + paths.last)
 
     } else if (req.getMethod.toUpperCase == "POST" && req.getRequestURI.endsWith("/info/lfs/objects/batch")) {
-      serviceGitLfsBatchAPI(req, res)
-
+      withLockRepository(req) {
+        serviceGitLfsBatchAPI(req, res)
+      }
     } else {
       // response for git client
-      super.service(req, res)
+      withLockRepository(req) {
+        super.service(req, res)
+      }
+    }
+  }
+
+  private def withLockRepository[T](req: HttpServletRequest)(f: => T): T = {
+    if (req.hasAttribute(Keys.Request.RepositoryLockKey)) {
+      LockUtil.lock(req.getAttribute(Keys.Request.RepositoryLockKey).asInstanceOf[String]) {
+        f
+      }
+    } else {
+      f
     }
   }
 
@@ -95,7 +114,7 @@ class GitRepositoryServlet extends GitServlet with SystemSettingsService {
                             GitLfs.Action(
                               href = baseUrl + "/git-lfs/" + owner + "/" + repository + "/" + requestObject.oid,
                               header =
-                                Map("Authorization" -> StringUtil.encodeBlowfish(timeout + " " + requestObject.oid)),
+                                Map("Authorization" -> StringUtil.encodeBlowfish(s"$timeout ${requestObject.oid}")),
                               expires_at = new Date(timeout)
                             )
                           )
@@ -116,7 +135,7 @@ class GitRepositoryServlet extends GitServlet with SystemSettingsService {
                             GitLfs.Action(
                               href = baseUrl + "/git-lfs/" + owner + "/" + repository + "/" + requestObject.oid,
                               header =
-                                Map("Authorization" -> StringUtil.encodeBlowfish(timeout + " " + requestObject.oid)),
+                                Map("Authorization" -> StringUtil.encodeBlowfish(s"$timeout ${requestObject.oid}")),
                               expires_at = new Date(timeout)
                             )
                           )
@@ -127,7 +146,7 @@ class GitRepositoryServlet extends GitServlet with SystemSettingsService {
               }
 
               res.setContentType("application/vnd.git-lfs+json")
-              using(res.getWriter) { out =>
+              Using.resource(res.getWriter) { out =>
                 out.print(write(batchResponse))
                 out.flush()
               }
@@ -138,10 +157,7 @@ class GitRepositoryServlet extends GitServlet with SystemSettingsService {
   }
 }
 
-class GitBucketRepositoryResolver(parent: FileResolver[HttpServletRequest])
-    extends RepositoryResolver[HttpServletRequest] {
-
-  private val resolver = new FileResolver[HttpServletRequest](new File(Directory.GitBucketHome), true)
+class GitBucketRepositoryResolver extends RepositoryResolver[HttpServletRequest] {
 
   override def open(req: HttpServletRequest, name: String): Repository = {
     // Rewrite repository path if routing is marched
@@ -150,10 +166,10 @@ class GitBucketRepositoryResolver(parent: FileResolver[HttpServletRequest])
       .map {
         case GitRepositoryRouting(urlPattern, localPath, _) =>
           val path = urlPattern.r.replaceFirstIn(name, localPath)
-          resolver.open(req, path)
+          new FileRepository(new File(Directory.GitBucketHome, path))
       }
       .getOrElse {
-        parent.open(req, name)
+        new FileRepository(new File(Directory.RepositoryHome, name))
       }
   }
 
@@ -206,7 +222,7 @@ class GitBucketReceivePackFactory extends ReceivePackFactory[HttpServletRequest]
   }
 }
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 class CommitLogHook(owner: String, repository: String, pusher: String, baseUrl: String, sshUrl: Option[String])
     extends PostReceiveHook
@@ -215,13 +231,16 @@ class CommitLogHook(owner: String, repository: String, pusher: String, baseUrl: 
     with AccountService
     with IssuesService
     with ActivityService
+    with MergeService
     with PullRequestService
     with WebHookService
     with LabelsService
     with PrioritiesService
     with MilestonesService
     with WebHookPullRequestService
-    with CommitsService {
+    with WebHookPullRequestReviewCommentService
+    with CommitsService
+    with SystemSettingsService {
 
   private val logger = LoggerFactory.getLogger(classOf[CommitLogHook])
   private var existIds: Seq[String] = Nil
@@ -238,7 +257,7 @@ class CommitLogHook(owner: String, repository: String, pusher: String, baseUrl: 
               command.setResult(ReceiveCommand.Result.REJECTED_OTHER_REASON, error)
             }
         }
-        using(Git.open(Directory.getRepositoryDir(owner, repository))) { git =>
+        Using.resource(Git.open(Directory.getRepositoryDir(owner, repository))) { git =>
           existIds = JGitUtil.getAllCommitIds(git)
         }
       } catch {
@@ -251,9 +270,11 @@ class CommitLogHook(owner: String, repository: String, pusher: String, baseUrl: 
   }
 
   def onPostReceive(receivePack: ReceivePack, commands: java.util.Collection[ReceiveCommand]): Unit = {
+    val settings = loadSystemSettings()
+
     Database() withTransaction { implicit session =>
       try {
-        using(Git.open(Directory.getRepositoryDir(owner, repository))) { git =>
+        Using.resource(Git.open(Directory.getRepositoryDir(owner, repository))) { git =>
           JGitUtil.removeCache(git)
 
           val pushedIds = scala.collection.mutable.Set[String]()
@@ -277,7 +298,7 @@ class CommitLogHook(owner: String, repository: String, pusher: String, baseUrl: 
             if (JGitUtil.isEmpty(git) && commits.nonEmpty && branchName != repositoryInfo.repository.defaultBranch) {
               saveRepositoryDefaultBranch(owner, repository, branchName)
               // Change repository HEAD
-              using(Git.open(Directory.getRepositoryDir(owner, repository))) { git =>
+              Using.resource(Git.open(Directory.getRepositoryDir(owner, repository))) { git =>
                 git.getRepository.updateRef(Constants.HEAD, true).link(Constants.R_HEADS + branchName)
               }
             }
@@ -299,7 +320,7 @@ class CommitLogHook(owner: String, repository: String, pusher: String, baseUrl: 
                     getAccountByUserName(pusher).foreach { pusherAccount =>
                       closeIssuesFromMessage(commit.fullMessage, pusher, owner, repository).foreach { issueId =>
                         getIssue(owner, repository, issueId.toString).foreach { issue =>
-                          callIssuesWebHook("closed", repositoryInfo, issue, baseUrl, pusherAccount)
+                          callIssuesWebHook("closed", repositoryInfo, issue, pusherAccount, settings)
                           PluginRegistry().getIssueHooks
                             .foreach(_.closedByCommitComment(issue, repositoryInfo, commit.fullMessage, pusherAccount))
                         }
@@ -319,7 +340,7 @@ class CommitLogHook(owner: String, repository: String, pusher: String, baseUrl: 
                   }.isDefined) {
                 markMergeAndClosePullRequest(pusher, owner, repository, pull)
                 getAccountByUserName(pusher).foreach { pusherAccount =>
-                  callPullRequestWebHook("closed", repositoryInfo, pull.issueId, baseUrl, pusherAccount)
+                  callPullRequestWebHook("closed", repositoryInfo, pull.issueId, pusherAccount, settings)
                 }
               }
             }
@@ -346,22 +367,15 @@ class CommitLogHook(owner: String, repository: String, pusher: String, baseUrl: 
               command.getType match {
                 case ReceiveCommand.Type.CREATE | ReceiveCommand.Type.UPDATE |
                     ReceiveCommand.Type.UPDATE_NONFASTFORWARD =>
-                  updatePullRequests(owner, repository, branchName)
                   getAccountByUserName(pusher).foreach { pusherAccount =>
-                    callPullRequestWebHookByRequestBranch(
-                      "synchronize",
-                      repositoryInfo,
-                      branchName,
-                      baseUrl,
-                      pusherAccount
-                    )
+                    updatePullRequests(owner, repository, branchName, pusherAccount, "synchronize", settings)
                   }
                 case _ =>
               }
             }
 
             // call web hook
-            callWebHookOf(owner, repository, WebHook.Push) {
+            callWebHookOf(owner, repository, WebHook.Push, settings) {
               for {
                 pusherAccount <- getAccountByUserName(pusher)
                 ownerAccount <- getAccountByUserName(owner)
@@ -379,18 +393,15 @@ class CommitLogHook(owner: String, repository: String, pusher: String, baseUrl: 
               }
             }
             if (command.getType == ReceiveCommand.Type.CREATE) {
-              callWebHookOf(owner, repository, WebHook.Create) {
+              callWebHookOf(owner, repository, WebHook.Create, settings) {
                 for {
                   pusherAccount <- getAccountByUserName(pusher)
                   ownerAccount <- getAccountByUserName(owner)
                 } yield {
                   val refType = if (refName(1) == "tags") "tag" else "branch"
                   WebHookCreatePayload(
-                    git,
                     pusherAccount,
-                    command.getRefName,
                     repositoryInfo,
-                    newCommits,
                     ownerAccount,
                     ref = branchName,
                     refType = refType
@@ -420,11 +431,14 @@ class WikiCommitHook(owner: String, repository: String, pusher: String, baseUrl:
     extends PostReceiveHook
     with WebHookService
     with AccountService
-    with RepositoryService {
+    with RepositoryService
+    with SystemSettingsService {
 
   private val logger = LoggerFactory.getLogger(classOf[WikiCommitHook])
 
   override def onPostReceive(receivePack: ReceivePack, commands: util.Collection[ReceiveCommand]): Unit = {
+    val settings = loadSystemSettings()
+
     Database() withTransaction { implicit session =>
       try {
         commands.asScala.headOption.foreach { command =>
@@ -441,7 +455,7 @@ class WikiCommitHook(owner: String, repository: String, pusher: String, baseUrl:
 
           commitIds.foreach {
             case (oldCommitId, newCommitId) =>
-              val commits = using(Git.open(Directory.getWikiRepositoryDir(owner, repository))) { git =>
+              val commits = Using.resource(Git.open(Directory.getWikiRepositoryDir(owner, repository))) { git =>
                 JGitUtil.getCommitLog(git, oldCommitId, newCommitId).flatMap { commit =>
                   val diffs = JGitUtil.getDiffs(git, None, commit.id, false, false)
                   diffs.collect {
@@ -460,7 +474,7 @@ class WikiCommitHook(owner: String, repository: String, pusher: String, baseUrl:
                     (commits.head._1, fileName, commits.last._3)
                 }
 
-              callWebHookOf(owner, repository, WebHook.Gollum) {
+              callWebHookOf(owner, repository, WebHook.Gollum, settings) {
                 for {
                   pusherAccount <- getAccountByUserName(pusher)
                   repositoryUser <- getAccountByUserName(owner)

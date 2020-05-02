@@ -6,9 +6,8 @@ import java.io.File
 import Directory._
 import ConfigUtil._
 import com.github.takezoe.slick.blocking.{BlockingH2Driver, BlockingJdbcProfile, BlockingMySQLDriver}
-import gitbucket.core.util.SyntaxSugars.defining
 import liquibase.database.AbstractJdbcDatabase
-import liquibase.database.core.{H2Database, MySQLDatabase, PostgresDatabase}
+import liquibase.database.core.{H2Database, MariaDBDatabase, MySQLDatabase, PostgresDatabase}
 import org.apache.commons.io.FileUtils
 
 import scala.reflect.ClassTag
@@ -54,16 +53,14 @@ object DatabaseConfig {
   lazy val minimumIdle: Option[Int] = getOptionValue("db.minimumIdle", config.getInt)
   lazy val maximumPoolSize: Option[Int] = getOptionValue("db.maximumPoolSize", config.getInt)
 
-  private def getValue[T](path: String, f: String => T): T = {
-    getSystemProperty(path).getOrElse(getEnvironmentVariable(path).getOrElse {
-      f(path)
-    })
+  private def getValue[T: ClassTag](path: String, f: String => T): T = {
+    getConfigValue(path).getOrElse(f(path))
   }
 
-  private def getOptionValue[T](path: String, f: String => T): Option[T] = {
-    getSystemProperty(path).orElse(getEnvironmentVariable(path).orElse {
+  private def getOptionValue[T: ClassTag](path: String, f: String => T): Option[T] = {
+    getConfigValue(path).orElse {
       if (config.hasPath(path)) Some(f(path)) else None
-    })
+    }
   }
 
 }
@@ -81,6 +78,8 @@ object DatabaseType {
       H2
     } else if (url.startsWith("jdbc:mysql:")) {
       MySQL
+    } else if (url.startsWith("jdbc:mariadb:")) {
+      MariaDb
     } else if (url.startsWith("jdbc:postgresql:")) {
       PostgreSQL
     } else {
@@ -100,6 +99,12 @@ object DatabaseType {
     val liquiDriver = new MySQLDatabase()
   }
 
+  object MariaDb extends DatabaseType {
+    val jdbcDriver = "org.mariadb.jdbc.Driver"
+    val slickDriver = BlockingMySQLDriver
+    val liquiDriver = new MariaDBDatabase()
+  }
+
   object PostgreSQL extends DatabaseType {
     val jdbcDriver = "org.postgresql.Driver2"
     val slickDriver = BlockingPostgresDriver
@@ -113,34 +118,4 @@ object DatabaseType {
       (s append '"').toString
     }
   }
-}
-
-object ConfigUtil {
-
-  def getEnvironmentVariable[A](key: String): Option[A] = {
-    val value = System.getenv("GITBUCKET_" + key.toUpperCase.replace('.', '_'))
-    if (value != null && value.nonEmpty) {
-      Some(convertType(value)).asInstanceOf[Option[A]]
-    } else {
-      None
-    }
-  }
-
-  def getSystemProperty[A](key: String): Option[A] = {
-    val value = System.getProperty("gitbucket." + key)
-    if (value != null && value.nonEmpty) {
-      Some(convertType(value)).asInstanceOf[Option[A]]
-    } else {
-      None
-    }
-  }
-
-  def convertType[A: ClassTag](value: String) =
-    defining(implicitly[ClassTag[A]].runtimeClass) { c =>
-      if (c == classOf[Boolean]) value.toBoolean
-      else if (c == classOf[Long]) value.toLong
-      else if (c == classOf[Int]) value.toInt
-      else value
-    }
-
 }

@@ -5,7 +5,6 @@ import java.io.File
 import gitbucket.core.account.html
 import gitbucket.core.helper
 import gitbucket.core.model._
-import gitbucket.core.plugin.PluginRegistry
 import gitbucket.core.service._
 import gitbucket.core.service.WebHookService._
 import gitbucket.core.ssh.SshUtil
@@ -26,6 +25,7 @@ class AccountController
     with WikiService
     with LabelsService
     with SshKeyService
+    with GpgKeyService
     with OneselfAuthenticator
     with UsersAuthenticator
     with GroupManagerAuthenticator
@@ -42,6 +42,7 @@ trait AccountControllerBase extends AccountManagementControllerBase {
     with WikiService
     with LabelsService
     with SshKeyService
+    with GpgKeyService
     with OneselfAuthenticator
     with UsersAuthenticator
     with GroupManagerAuthenticator
@@ -75,11 +76,13 @@ trait AccountControllerBase extends AccountManagementControllerBase {
 
   case class SshKeyForm(title: String, publicKey: String)
 
+  case class GpgKeyForm(title: String, publicKey: String)
+
   case class PersonalTokenForm(note: String)
 
   val newForm = mapping(
     "userName" -> trim(label("User name", text(required, maxlength(100), identifier, uniqueUserName, reservedNames))),
-    "password" -> trim(label("Password", text(required, maxlength(20), password))),
+    "password" -> trim(label("Password", text(required, maxlength(20)))),
     "fullName" -> trim(label("Full Name", text(required, maxlength(100)))),
     "mailAddress" -> trim(label("Mail Address", text(required, maxlength(100), uniqueMailAddress()))),
     "extraMailAddresses" -> list(
@@ -91,7 +94,7 @@ trait AccountControllerBase extends AccountManagementControllerBase {
   )(AccountNewForm.apply)
 
   val editForm = mapping(
-    "password" -> trim(label("Password", optional(text(maxlength(20), password)))),
+    "password" -> trim(label("Password", optional(text(maxlength(20))))),
     "fullName" -> trim(label("Full Name", text(required, maxlength(100)))),
     "mailAddress" -> trim(label("Mail Address", text(required, maxlength(100), uniqueMailAddress("userName")))),
     "extraMailAddresses" -> list(
@@ -107,6 +110,11 @@ trait AccountControllerBase extends AccountManagementControllerBase {
     "title" -> trim(label("Title", text(required, maxlength(100)))),
     "publicKey" -> trim2(label("Key", text(required, validPublicKey)))
   )(SshKeyForm.apply)
+
+  val gpgKeyForm = mapping(
+    "title" -> trim(label("Title", text(required, maxlength(100)))),
+    "publicKey" -> label("Key", text(required, validGpgPublicKey))
+  )(GpgKeyForm.apply)
 
   val personalTokenForm = mapping(
     "note" -> trim(label("Token", text(required, maxlength(100))))
@@ -247,12 +255,7 @@ trait AccountControllerBase extends AccountManagementControllerBase {
             account,
             members,
             extraMailAddresses,
-            context.loginAccount.exists(
-              x =>
-                members.exists { member =>
-                  member.userName == x.userName && member.isManager
-              }
-            )
+            isGroupManager(context.loginAccount, members)
           )
         }
 
@@ -264,12 +267,7 @@ trait AccountControllerBase extends AccountManagementControllerBase {
             if (account.isGroupAccount) Nil else getGroupsByUserName(userName),
             getVisibleRepositories(context.loginAccount, Some(userName)),
             extraMailAddresses,
-            context.loginAccount.exists(
-              x =>
-                members.exists { member =>
-                  member.userName == x.userName && member.isManager
-              }
-            )
+            isGroupManager(context.loginAccount, members)
           )
         }
       }
@@ -338,7 +336,7 @@ trait AccountControllerBase extends AccountManagementControllerBase {
 
         updateImage(userName, form.fileId, form.clearImage)
         updateAccountExtraMailAddresses(userName, form.extraMailAddresses.filter(_ != ""))
-        flash += "info" -> "Account information has been updated."
+        flash.update("info", "Account information has been updated.")
         redirect(s"/${userName}/_edit")
 
     } getOrElse NotFound()
@@ -350,7 +348,7 @@ trait AccountControllerBase extends AccountManagementControllerBase {
     getAccountByUserName(userName, true).map {
       account =>
         if (isLastAdministrator(account)) {
-          flash += "error" -> "Account can't be removed because this is last one administrator."
+          flash.update("error", "Account can't be removed because this is last one administrator.")
           redirect(s"/${userName}/_edit")
         } else {
 //      // Remove repositories
@@ -360,13 +358,7 @@ trait AccountControllerBase extends AccountManagementControllerBase {
 //        FileUtils.deleteDirectory(getWikiRepositoryDir(userName, repositoryName))
 //        FileUtils.deleteDirectory(getTemporaryDir(userName, repositoryName))
 //      }
-          // Remove from GROUP_MEMBER and COLLABORATOR
-          removeUserRelatedData(userName)
-          updateAccount(account.copy(isRemoved = true))
-
-          // call hooks
-          PluginRegistry().getAccountHooks.foreach(_.deleted(userName))
-
+          suspendAccount(account)
           session.invalidate
           redirect("/")
         }
@@ -393,6 +385,27 @@ trait AccountControllerBase extends AccountManagementControllerBase {
     redirect(s"/${userName}/_ssh")
   })
 
+  get("/:userName/_gpg")(oneselfOnly {
+    val userName = params("userName")
+    getAccountByUserName(userName).map { x =>
+      //html.ssh(x, getPublicKeys(x.userName))
+      html.gpg(x, getGpgPublicKeys(x.userName))
+    } getOrElse NotFound()
+  })
+
+  post("/:userName/_gpg", gpgKeyForm)(oneselfOnly { form =>
+    val userName = params("userName")
+    addGpgPublicKey(userName, form.title, form.publicKey)
+    redirect(s"/${userName}/_gpg")
+  })
+
+  get("/:userName/_gpg/delete/:id")(oneselfOnly {
+    val userName = params("userName")
+    val keyId = params("id").toInt
+    deleteGpgPublicKey(userName, keyId)
+    redirect(s"/${userName}/_gpg")
+  })
+
   get("/:userName/_application")(oneselfOnly {
     val userName = params("userName")
     getAccountByUserName(userName).map { x =>
@@ -415,7 +428,7 @@ trait AccountControllerBase extends AccountManagementControllerBase {
     val userName = params("userName")
     getAccountByUserName(userName).map { x =>
       val (tokenId, token) = generateAccessToken(userName, form.note)
-      flash += "generatedToken" -> (tokenId, token)
+      flash.update("generatedToken", (tokenId, token))
     }
     redirect(s"/${userName}/_application")
   })
@@ -427,7 +440,7 @@ trait AccountControllerBase extends AccountManagementControllerBase {
     redirect(s"/${userName}/_application")
   })
 
-  get("/:userName/_hooks")(oneselfOnly {
+  get("/:userName/_hooks")(managersOnly {
     val userName = params("userName")
     getAccountByUserName(userName).map { account =>
       gitbucket.core.account.html.hooks(account, getAccountWebHooks(account.userName), flash.get("info"))
@@ -437,7 +450,7 @@ trait AccountControllerBase extends AccountManagementControllerBase {
   /**
    * Display the account web hook edit page.
    */
-  get("/:userName/_hooks/new")(oneselfOnly {
+  get("/:userName/_hooks/new")(managersOnly {
     val userName = params("userName")
     getAccountByUserName(userName).map { account =>
       val webhook = AccountWebHook(userName, "", WebHookContentType.FORM, None)
@@ -448,27 +461,27 @@ trait AccountControllerBase extends AccountManagementControllerBase {
   /**
    * Add the account web hook URL.
    */
-  post("/:userName/_hooks/new", accountWebHookForm(false))(oneselfOnly { form =>
+  post("/:userName/_hooks/new", accountWebHookForm(false))(managersOnly { form =>
     val userName = params("userName")
     addAccountWebHook(userName, form.url, form.events, form.ctype, form.token)
-    flash += "info" -> s"Webhook ${form.url} created"
+    flash.update("info", s"Webhook ${form.url} created")
     redirect(s"/${userName}/_hooks")
   })
 
   /**
    * Delete the account web hook URL.
    */
-  get("/:userName/_hooks/delete")(oneselfOnly {
+  get("/:userName/_hooks/delete")(managersOnly {
     val userName = params("userName")
     deleteAccountWebHook(userName, params("url"))
-    flash += "info" -> s"Webhook ${params("url")} deleted"
+    flash.update("info", s"Webhook ${params("url")} deleted")
     redirect(s"/${userName}/_hooks")
   })
 
   /**
    * Display the account web hook edit page.
    */
-  get("/:userName/_hooks/edit")(oneselfOnly {
+  get("/:userName/_hooks/edit")(managersOnly {
     val userName = params("userName")
     getAccountByUserName(userName).flatMap { account =>
       getAccountWebHook(userName, params("url")).map {
@@ -481,17 +494,17 @@ trait AccountControllerBase extends AccountManagementControllerBase {
   /**
    * Update account web hook settings.
    */
-  post("/:userName/_hooks/edit", accountWebHookForm(true))(oneselfOnly { form =>
+  post("/:userName/_hooks/edit", accountWebHookForm(true))(managersOnly { form =>
     val userName = params("userName")
     updateAccountWebHook(userName, form.url, form.events, form.ctype, form.token)
-    flash += "info" -> s"webhook ${form.url} updated"
+    flash.update("info", s"webhook ${form.url} updated")
     redirect(s"/${userName}/_hooks")
   })
 
   /**
    * Send the test request to registered account web hook URLs.
    */
-  ajaxPost("/:userName/_hooks/test")(oneselfOnly {
+  ajaxPost("/:userName/_hooks/test")(managersOnly {
     // TODO Is it possible to merge with [[RepositorySettingsController.ajaxPost]]?
     import scala.concurrent.duration._
     import scala.concurrent._
@@ -513,13 +526,14 @@ trait AccountControllerBase extends AccountManagementControllerBase {
       WebHookPushPayload.createDummyPayload(ownerAccount)
     }
 
-    val (webHook, json, reqFuture, resFuture) = callWebHook(WebHook.Push, List(dummyWebHookInfo), dummyPayload).head
+    val (webHook, json, reqFuture, resFuture) =
+      callWebHook(WebHook.Push, List(dummyWebHookInfo), dummyPayload, context.settings).head
 
     val toErrorMap: PartialFunction[Throwable, Map[String, String]] = {
       case e: java.net.UnknownHostException                  => Map("error" -> ("Unknown host " + e.getMessage))
       case e: java.lang.IllegalArgumentException             => Map("error" -> ("invalid url"))
       case e: org.apache.http.client.ClientProtocolException => Map("error" -> ("invalid url"))
-      case NonFatal(e)                                       => Map("error" -> (e.getClass + " " + e.getMessage))
+      case NonFatal(e)                                       => Map("error" -> (s"${e.getClass} ${e.getMessage}"))
     }
 
     contentType = formats("json")
@@ -659,7 +673,7 @@ trait AccountControllerBase extends AccountManagementControllerBase {
 
           updateImage(form.groupName, form.fileId, form.clearImage)
 
-          flash += "info" -> "Account information has been updated."
+          flash.update("info", "Account information has been updated.")
           redirect(s"/${groupName}/_editgroup")
 
         } getOrElse NotFound()
@@ -777,6 +791,20 @@ trait AccountControllerBase extends AccountManagementControllerBase {
       }
   }
 
+  private def validGpgPublicKey: Constraint = new Constraint() {
+    override def validate(name: String, value: String, messages: Messages): Option[String] = {
+      GpgUtil.str2GpgKeyId(value) match {
+        case Some(s) if GpgUtil.getGpgKey(s).isEmpty =>
+          None
+        case Some(_) =>
+          Some("GPG key is duplicated.")
+        case None =>
+          Some("GPG key is invalid.")
+      }
+    }
+
+  }
+
   private def validAccountName: Constraint = new Constraint() {
     override def validate(name: String, value: String, messages: Messages): Option[String] = {
       getAccountByUserName(value) match {
@@ -785,4 +813,13 @@ trait AccountControllerBase extends AccountManagementControllerBase {
       }
     }
   }
+
+  private def isGroupManager(account: Option[Account], members: Seq[GroupMember]): Boolean = {
+    account.exists { account =>
+      account.isAdmin || members.exists { member =>
+        member.userName == account.userName && member.isManager
+      }
+    }
+  }
+
 }

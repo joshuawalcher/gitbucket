@@ -6,6 +6,7 @@ import java.util.{Date, Locale, TimeZone}
 import com.nimbusds.jose.util.JSONObjectUtils
 import gitbucket.core.controller.Context
 import gitbucket.core.model.CommitState
+import gitbucket.core.model.PullRequest
 import gitbucket.core.plugin.{PluginRegistry, RenderRequest}
 import gitbucket.core.service.RepositoryService.RepositoryInfo
 import gitbucket.core.service.{RepositoryService, RequestCache}
@@ -102,6 +103,7 @@ object helpers extends AvatarImageProvider with LinkConverter with RequestCache 
   def markdown(
     markdown: String,
     repository: RepositoryService.RepositoryInfo,
+    branch: String,
     enableWikiLink: Boolean,
     enableRefsLink: Boolean,
     enableLineBreaks: Boolean,
@@ -114,6 +116,7 @@ object helpers extends AvatarImageProvider with LinkConverter with RequestCache 
       Markdown.toHtml(
         markdown = markdown,
         repository = repository,
+        branch = branch,
         enableWikiLink = enableWikiLink,
         enableRefsLink = enableRefsLink,
         enableAnchor = enableAnchor,
@@ -216,14 +219,18 @@ object helpers extends AvatarImageProvider with LinkConverter with RequestCache 
         .replaceAll(
           "\\[branch:([^\\s]+?)/([^\\s]+?)#([^\\s]+?)\\]",
           (m: Match) =>
-            s"""<a href="${context.path}/${m.group(1)}/${m.group(2)}/tree/${encodeRefName(m.group(3))}">${m
-              .group(3)}</a>"""
+            s"""<a href="${context.path}/${m.group(1)}/${m.group(2)}/tree/${encodeRefName(m.group(3))}">${StringUtil
+              .escapeHtml(
+                m.group(3)
+              )}</a>"""
         )
         .replaceAll(
           "\\[tag:([^\\s]+?)/([^\\s]+?)#([^\\s]+?)\\]",
           (m: Match) =>
-            s"""<a href="${context.path}/${m.group(1)}/${m.group(2)}/tree/${encodeRefName(m.group(3))}">${m
-              .group(3)}</a>"""
+            s"""<a href="${context.path}/${m.group(1)}/${m.group(2)}/tree/${encodeRefName(m.group(3))}">${StringUtil
+              .escapeHtml(
+                m.group(3)
+              )}</a>"""
         )
         .replaceAll("\\[user:([^\\s]+?)\\]", (m: Match) => user(m.group(1)).body)
         .replaceAll(
@@ -231,6 +238,14 @@ object helpers extends AvatarImageProvider with LinkConverter with RequestCache 
           (m: Match) =>
             s"""<a href="${context.path}/${m.group(1)}/${m.group(2)}/commit/${m.group(3)}">${m.group(1)}/${m
               .group(2)}@${m.group(3).substring(0, 7)}</a>"""
+        )
+        .replaceAll(
+          "\\[release:([^\\s]+?)/([^\\s]+?)/([^\\s]+?):(.+)\\]",
+          (m: Match) =>
+            s"""<a href="${context.path}/${m.group(1)}/${m.group(2)}/releases/${encodeRefName(m.group(3))}">${StringUtil
+              .escapeHtml(
+                m.group(4)
+              )}</a>"""
         )
     )
 
@@ -258,6 +273,18 @@ object helpers extends AvatarImageProvider with LinkConverter with RequestCache 
    * Generates the url to the account page.
    */
   def url(userName: String)(implicit context: Context): String = s"${context.path}/${encodeRefName(userName)}"
+
+  /**
+   * Generates the url to the pull request base branch.
+   */
+  def basePRBranchUrl(pullreq: PullRequest)(implicit context: Context): String =
+    s"${context.path}/${encodeRefName(pullreq.userName)}/${encodeRefName(pullreq.repositoryName)}/tree/${encodeRefName(pullreq.branch)}"
+
+  /**
+   * Generates the url to the pull request branch.
+   */
+  def requestPRBranchUrl(pullreq: PullRequest)(implicit context: Context): String =
+    s"${context.path}/${encodeRefName(pullreq.requestUserName)}/${encodeRefName(pullreq.repositoryName)}/tree/${encodeRefName(pullreq.requestBranch)}"
 
   /**
    * Returns the url to the root of assets.
@@ -466,5 +493,9 @@ object helpers extends AvatarImageProvider with LinkConverter with RequestCache 
   }
 
   case class CommentDiffLine(newLine: Option[String], oldLine: Option[String], `type`: String, text: String)
+
+  def appendQueryString(baseUrl: String, queryString: String): String = {
+    s"$baseUrl${if (baseUrl.contains("?")) "&" else "?"}$queryString"
+  }
 
 }

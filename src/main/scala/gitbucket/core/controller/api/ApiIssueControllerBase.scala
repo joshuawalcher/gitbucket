@@ -5,7 +5,7 @@ import gitbucket.core.model.{Account, Issue}
 import gitbucket.core.service.{AccountService, IssueCreationService, IssuesService, MilestonesService}
 import gitbucket.core.service.IssuesService.IssueSearchCondition
 import gitbucket.core.service.PullRequestService.PullRequestLimit
-import gitbucket.core.util.{ReadableUsersAuthenticator, ReferrerAuthenticator, RepositoryName}
+import gitbucket.core.util.{ReadableUsersAuthenticator, ReferrerAuthenticator, RepositoryName, UsersAuthenticator}
 import gitbucket.core.util.Implicits._
 
 trait ApiIssueControllerBase extends ControllerBase {
@@ -18,6 +18,7 @@ trait ApiIssueControllerBase extends ControllerBase {
   /*
    * i. List issues
    * https://developer.github.com/v3/issues/#list-issues
+   * requested: 1743
    */
 
   /*
@@ -30,7 +31,7 @@ trait ApiIssueControllerBase extends ControllerBase {
     val condition = IssueSearchCondition(request)
     val baseOwner = getAccountByUserName(repository.owner).get
 
-    val issues: List[(Issue, Account)] =
+    val issues: List[(Issue, Account, Option[Account])] =
       searchIssueByApi(
         condition = condition,
         offset = (page - 1) * PullRequestLimit,
@@ -39,11 +40,12 @@ trait ApiIssueControllerBase extends ControllerBase {
       )
 
     JsonFormat(issues.map {
-      case (issue, issueUser) =>
+      case (issue, issueUser, assignedUser) =>
         ApiIssue(
           issue = issue,
           repositoryName = RepositoryName(repository),
           user = ApiUser(issueUser),
+          assignee = assignedUser.map(ApiUser(_)),
           labels = getIssueLabels(repository.owner, repository.name, issue.issueId)
             .map(ApiLabel(_, RepositoryName(repository)))
         )
@@ -58,13 +60,15 @@ trait ApiIssueControllerBase extends ControllerBase {
     (for {
       issueId <- params("id").toIntOpt
       issue <- getIssue(repository.owner, repository.name, issueId.toString)
-      openedUser <- getAccountByUserName(issue.openedUserName)
+      users = getAccountsByUserNames(Set(issue.openedUserName) ++ issue.assignedUserName, Set())
+      openedUser <- users.get(issue.openedUserName)
     } yield {
       JsonFormat(
         ApiIssue(
           issue,
           RepositoryName(repository),
           ApiUser(openedUser),
+          issue.assignedUserName.flatMap(users.get(_)).map(ApiUser(_)),
           getIssueLabels(repository.owner, repository.name, issue.issueId).map(ApiLabel(_, RepositoryName(repository)))
         )
       )
@@ -97,6 +101,7 @@ trait ApiIssueControllerBase extends ControllerBase {
             issue,
             RepositoryName(repository),
             ApiUser(loginAccount),
+            issue.assignedUserName.flatMap(getAccountByUserName(_)).map(ApiUser(_)),
             getIssueLabels(repository.owner, repository.name, issue.issueId)
               .map(ApiLabel(_, RepositoryName(repository)))
           )

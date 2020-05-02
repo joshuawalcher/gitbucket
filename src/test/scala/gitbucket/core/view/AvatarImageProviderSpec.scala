@@ -2,15 +2,15 @@ package gitbucket.core.view
 
 import java.text.SimpleDateFormat
 import java.util.Date
-import javax.servlet.http.{HttpServletRequest, HttpSession}
 
+import javax.servlet.http.{HttpServletRequest, HttpSession}
 import gitbucket.core.controller.Context
 import gitbucket.core.model.Account
 import gitbucket.core.service.RequestCache
-import gitbucket.core.service.SystemSettingsService.{Ssh, SystemSettings}
+import gitbucket.core.service.SystemSettingsService.{Ssh, SystemSettings, WebHook, Upload}
 import org.mockito.Mockito._
 import org.scalatest.FunSpec
-import org.scalatest.mockito.MockitoSugar
+import org.scalatestplus.mockito.MockitoSugar
 import play.twirl.api.Html
 
 class AvatarImageProviderSpec extends FunSpec with MockitoSugar {
@@ -125,6 +125,7 @@ class AvatarImageProviderSpec extends FunSpec with MockitoSugar {
       gravatar = useGravatar,
       notification = false,
       activityLogLimit = None,
+      limitVisibleRepositories = false,
       ssh = Ssh(
         enabled = false,
         sshHost = None,
@@ -138,8 +139,16 @@ class AvatarImageProviderSpec extends FunSpec with MockitoSugar {
       oidc = None,
       skinName = "skin-blue",
       showMailAddress = false,
-      pluginNetworkInstall = false,
-      pluginProxy = None
+      webHook = WebHook(
+        blockPrivateAddress = false,
+        whitelist = Nil
+      ),
+      upload = Upload(
+        maxFileSize = 3 * 1024 * 1024,
+        timeout = 30 * 10000,
+        largeMaxFileSize = 3 * 1024 * 1024,
+        largeTimeout = 30 * 10000
+      )
     )
 
   /**

@@ -3,24 +3,26 @@ package gitbucket.core.service
 import fr.brouillard.oss.security.xhub.XHub
 import fr.brouillard.oss.security.xhub.XHub.{XHubConverter, XHubDigest}
 import gitbucket.core.api._
+import gitbucket.core.controller.Context
 import gitbucket.core.model.{
   Account,
+  AccountWebHook,
+  AccountWebHookEvent,
   CommitComment,
   Issue,
   IssueComment,
   Label,
   PullRequest,
-  WebHook,
   RepositoryWebHook,
   RepositoryWebHookEvent,
-  AccountWebHook,
-  AccountWebHookEvent
+  WebHook
 }
 import gitbucket.core.model.Profile._
 import gitbucket.core.model.Profile.profile.blockingApi._
 import org.apache.http.client.utils.URLEncodedUtils
 import gitbucket.core.util.JGitUtil.CommitInfo
-import gitbucket.core.util.{RepositoryName, StringUtil}
+import gitbucket.core.util.Implicits._
+import gitbucket.core.util.{HttpClientUtil, RepositoryName, StringUtil}
 import gitbucket.core.service.RepositoryService.RepositoryInfo
 import org.apache.http.NameValuePair
 import org.apache.http.client.entity.UrlEncodedFormEntity
@@ -34,6 +36,7 @@ import scala.util.{Failure, Success}
 import org.apache.http.HttpRequest
 import org.apache.http.HttpResponse
 import gitbucket.core.model.WebHookContentType
+import gitbucket.core.service.SystemSettingsService.SystemSettings
 import org.apache.http.client.entity.EntityBuilder
 import org.apache.http.entity.ContentType
 
@@ -55,6 +58,7 @@ trait WebHookService {
       .map { case (w, t) => w -> t.event }
       .list
       .groupBy(_._1)
+      .view
       .mapValues(_.map(_._2).toSet)
       .toList
       .sortBy(_._1.url)
@@ -87,6 +91,7 @@ trait WebHookService {
       .map { case (w, t) => w -> t.event }
       .list
       .groupBy(_._1)
+      .view
       .mapValues(_.map(_._2).toSet)
       .headOption
 
@@ -136,6 +141,7 @@ trait WebHookService {
       .map { case (w, t) => w -> t.event }
       .list
       .groupBy(_._1)
+      .view
       .mapValues(_.map(_._2).toSet)
       .toList
       .sortBy(_._1.url)
@@ -164,6 +170,7 @@ trait WebHookService {
       .map { case (w, t) => w -> t.event }
       .list
       .groupBy(_._1)
+      .view
       .mapValues(_.map(_._2).toSet)
       .headOption
 
@@ -197,20 +204,28 @@ trait WebHookService {
   def deleteAccountWebHook(owner: String, url: String)(implicit s: Session): Unit =
     AccountWebHooks.filter(_.byPrimaryKey(owner, url)).delete
 
-  def callWebHookOf(owner: String, repository: String, event: WebHook.Event)(
+  def callWebHookOf(owner: String, repository: String, event: WebHook.Event, settings: SystemSettings)(
     makePayload: => Option[WebHookPayload]
   )(implicit s: Session, c: JsonFormat.Context): Unit = {
     val webHooks = getWebHooksByEvent(owner, repository, event)
     if (webHooks.nonEmpty) {
-      makePayload.map(callWebHook(event, webHooks, _))
+      makePayload.map(callWebHook(event, webHooks, _, settings))
     }
     val accountWebHooks = getAccountWebHooksByEvent(owner, event)
     if (accountWebHooks.nonEmpty) {
-      makePayload.map(callWebHook(event, accountWebHooks, _))
+      makePayload.map(callWebHook(event, accountWebHooks, _, settings))
     }
   }
 
-  def callWebHook(event: WebHook.Event, webHooks: List[WebHook], payload: WebHookPayload)(
+  private def validateTargetAddress(settings: SystemSettings, url: String): Boolean = {
+    val host = new java.net.URL(url).getHost
+
+    !settings.webHook.blockPrivateAddress ||
+    !HttpClientUtil.isPrivateAddress(host) ||
+    settings.webHook.whitelist.exists(range => HttpClientUtil.inIpRange(range, host))
+  }
+
+  def callWebHook(event: WebHook.Event, webHooks: List[WebHook], payload: WebHookPayload, settings: SystemSettings)(
     implicit c: JsonFormat.Context
   ): List[(WebHook, String, Future[HttpRequest], Future[HttpResponse])] = {
     import org.apache.http.impl.client.HttpClientBuilder
@@ -230,10 +245,13 @@ trait WebHookService {
             }
           }
           try {
+            if (!validateTargetAddress(settings, webHook.url)) {
+              throw new IllegalArgumentException(s"Illegal address: ${webHook.url}")
+            }
             val httpClient = HttpClientBuilder.create.useSystemProperties.addInterceptorLast(itcp).build
             logger.debug(s"start web hook invocation for ${webHook.url}")
             val httpPost = new HttpPost(webHook.url)
-            logger.info(s"Content-Type: ${webHook.ctype.ctype}")
+            logger.debug(s"Content-Type: ${webHook.ctype.ctype}")
             httpPost.addHeader("Content-Type", webHook.ctype.ctype)
             httpPost.addHeader("X-Github-Event", event.name)
             httpPost.addHeader("X-Github-Delivery", java.util.UUID.randomUUID().toString)
@@ -298,7 +316,6 @@ trait WebHookService {
     } else {
       Nil
     }
-    // logger.debug("end callWebHook")
   }
 }
 
@@ -311,11 +328,12 @@ trait WebHookPullRequestService extends WebHookService {
     action: String,
     repository: RepositoryService.RepositoryInfo,
     issue: Issue,
-    baseUrl: String,
-    sender: Account
+    sender: Account,
+    settings: SystemSettings
   )(implicit s: Session, context: JsonFormat.Context): Unit = {
-    callWebHookOf(repository.owner, repository.name, WebHook.Issues) {
-      val users = getAccountsByUserNames(Set(repository.owner, issue.openedUserName), Set(sender))
+    callWebHookOf(repository.owner, repository.name, WebHook.Issues, settings) {
+      val users =
+        getAccountsByUserNames(Set(repository.owner, issue.openedUserName) ++ issue.assignedUserName, Set(sender))
       for {
         repoOwner <- users.get(repository.owner)
         issueUser <- users.get(issue.openedUserName)
@@ -328,6 +346,7 @@ trait WebHookPullRequestService extends WebHookService {
             issue,
             RepositoryName(repository),
             ApiUser(issueUser),
+            issue.assignedUserName.flatMap(users.get(_)).map(ApiUser(_)),
             getIssueLabels(repository.owner, repository.name, issue.issueId)
               .map(ApiLabel(_, RepositoryName(repository)))
           ),
@@ -341,11 +360,11 @@ trait WebHookPullRequestService extends WebHookService {
     action: String,
     repository: RepositoryService.RepositoryInfo,
     issueId: Int,
-    baseUrl: String,
-    sender: Account
+    sender: Account,
+    settings: SystemSettings
   )(implicit s: Session, c: JsonFormat.Context): Unit = {
     import WebHookService._
-    callWebHookOf(repository.owner, repository.name, WebHook.PullRequest) {
+    callWebHookOf(repository.owner, repository.name, WebHook.PullRequest, settings) {
       for {
         (issue, pullRequest) <- getPullRequest(repository.owner, repository.name, issueId)
         users = getAccountsByUserNames(
@@ -398,14 +417,14 @@ trait WebHookPullRequestService extends WebHookService {
       if wht.event === WebHook.PullRequest.asInstanceOf[WebHook.Event].bind && wht.byRepositoryWebHook(wh)
     } yield {
       ((is, iu, pr, bu, ru), wh)
-    }).list.groupBy(_._1).mapValues(_.map(_._2))
+    }).list.groupBy(_._1).map { case (k, v) => (k, v.map(_._2)) }
 
   def callPullRequestWebHookByRequestBranch(
     action: String,
     requestRepository: RepositoryService.RepositoryInfo,
     requestBranch: String,
-    baseUrl: String,
-    sender: Account
+    sender: Account,
+    settings: SystemSettings
   )(implicit s: Session, c: JsonFormat.Context): Unit = {
     import WebHookService._
     for {
@@ -436,7 +455,7 @@ trait WebHookPullRequestService extends WebHookService {
         mergedComment = getMergedComment(baseRepo.owner, baseRepo.name, issue.issueId)
       )
 
-      callWebHook(WebHook.PullRequest, webHooks, payload)
+      callWebHook(WebHook.PullRequest, webHooks, payload, settings)
     }
   }
 
@@ -450,11 +469,11 @@ trait WebHookPullRequestReviewCommentService extends WebHookService {
     repository: RepositoryService.RepositoryInfo,
     issue: Issue,
     pullRequest: PullRequest,
-    baseUrl: String,
-    sender: Account
+    sender: Account,
+    settings: SystemSettings
   )(implicit s: Session, c: JsonFormat.Context): Unit = {
     import WebHookService._
-    callWebHookOf(repository.owner, repository.name, WebHook.PullRequestReviewComment) {
+    callWebHookOf(repository.owner, repository.name, WebHook.PullRequestReviewComment, settings) {
       val users =
         getAccountsByUserNames(Set(repository.owner, pullRequest.requestUserName, issue.openedUserName), Set(sender))
       for {
@@ -496,18 +515,20 @@ trait WebHookIssueCommentService extends WebHookPullRequestService {
     repository: RepositoryService.RepositoryInfo,
     issue: Issue,
     issueCommentId: Int,
-    sender: Account
+    sender: Account,
+    settings: SystemSettings
   )(implicit s: Session, c: JsonFormat.Context): Unit = {
-    callWebHookOf(repository.owner, repository.name, WebHook.IssueComment) {
+    callWebHookOf(repository.owner, repository.name, WebHook.IssueComment, settings) {
       for {
         issueComment <- getComment(repository.owner, repository.name, issueCommentId.toString())
         users = getAccountsByUserNames(
-          Set(issue.openedUserName, repository.owner, issueComment.commentedUserName),
+          Set(issue.openedUserName, repository.owner, issueComment.commentedUserName) ++ issue.assignedUserName,
           Set(sender)
         )
         issueUser <- users.get(issue.openedUserName)
         repoOwner <- users.get(repository.owner)
         commenter <- users.get(issueComment.commentedUserName)
+        assignedUser = issue.assignedUserName.flatMap(users.get(_))
         labels = getIssueLabels(repository.owner, repository.name, issue.issueId)
       } yield {
         WebHookIssueCommentPayload(
@@ -517,6 +538,7 @@ trait WebHookIssueCommentService extends WebHookPullRequestService {
           commentUser = commenter,
           repository = repository,
           repositoryUser = repoOwner,
+          assignedUser = assignedUser,
           sender = sender,
           labels = labels
         )
@@ -544,11 +566,8 @@ object WebHookService {
   object WebHookCreatePayload {
 
     def apply(
-      git: Git,
       sender: Account,
-      refName: String,
       repositoryInfo: RepositoryInfo,
-      commits: List[CommitInfo],
       repositoryOwner: Account,
       ref: String,
       refType: String
@@ -559,7 +578,7 @@ object WebHookService {
         ref_type = refType,
         description = repositoryInfo.repository.description.getOrElse(""),
         master_branch = repositoryInfo.repository.defaultBranch,
-        repository = ApiRepository.forWebhookPayload(repositoryInfo, owner = ApiUser(repositoryOwner))
+        repository = ApiRepository(repositoryInfo, repositoryOwner)
       )
   }
 
@@ -601,9 +620,9 @@ object WebHookService {
         before = ObjectId.toString(oldId),
         after = ObjectId.toString(newId),
         commits = commits.map { commit =>
-          ApiCommit.forWebhookPayload(git, RepositoryName(repositoryInfo), commit)
+          ApiCommit(git, RepositoryName(repositoryInfo), commit)
         },
-        repository = ApiRepository.forWebhookPayload(repositoryInfo, owner = ApiUser(repositoryOwner))
+        repository = ApiRepository(repositoryInfo, repositoryOwner)
       )
 
     def createDummyPayload(sender: Account): WebHookPushPayload =
@@ -693,6 +712,7 @@ object WebHookService {
       commentUser: Account,
       repository: RepositoryInfo,
       repositoryUser: Account,
+      assignedUser: Option[Account],
       sender: Account,
       labels: List[Label]
     ): WebHookIssueCommentPayload =
@@ -703,6 +723,7 @@ object WebHookService {
           issue,
           RepositoryName(repository),
           ApiUser(issueUser),
+          assignedUser.map(ApiUser(_)),
           labels.map(ApiLabel(_, RepositoryName(repository)))
         ),
         comment =

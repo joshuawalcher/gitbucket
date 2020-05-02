@@ -1,7 +1,7 @@
 package gitbucket.core.controller
 
 import gitbucket.core.api._
-import gitbucket.core.controller.api.{ApiOrganizationControllerBase, ApiRepositoryControllerBase, ApiUserControllerBase}
+import gitbucket.core.controller.api._
 import gitbucket.core.service._
 import gitbucket.core.util.Implicits._
 import gitbucket.core.util._
@@ -9,8 +9,19 @@ import gitbucket.core.plugin.PluginRegistry
 
 class ApiController
     extends ApiControllerBase
+    with ApiGitReferenceControllerBase
+    with ApiIssueCommentControllerBase
+    with ApiIssueControllerBase
+    with ApiIssueLabelControllerBase
     with ApiOrganizationControllerBase
+    with ApiPullRequestControllerBase
+    with ApiReleaseControllerBase
+    with ApiRepositoryBranchControllerBase
+    with ApiRepositoryCollaboratorControllerBase
+    with ApiRepositoryCommitControllerBase
+    with ApiRepositoryContentsControllerBase
     with ApiRepositoryControllerBase
+    with ApiRepositoryStatusControllerBase
     with ApiUserControllerBase
     with RepositoryService
     with AccountService
@@ -21,15 +32,20 @@ class ApiController
     with PullRequestService
     with CommitsService
     with CommitStatusService
+    with ReleaseService
     with RepositoryCreationService
+    with RepositoryCommitFileService
     with IssueCreationService
     with HandleCommentService
+    with MergeService
     with WebHookService
     with WebHookPullRequestService
     with WebHookIssueCommentService
+    with WebHookPullRequestReviewCommentService
     with WikiService
     with ActivityService
     with PrioritiesService
+    with AdminAuthenticator
     with OwnerAuthenticator
     with UsersAuthenticator
     with GroupManagerAuthenticator

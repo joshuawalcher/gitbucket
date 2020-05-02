@@ -10,6 +10,7 @@ import gitbucket.core.service._
 import gitbucket.core.util.Implicits._
 import gitbucket.core.util.SyntaxSugars._
 import gitbucket.core.util._
+import gitbucket.core.view.helpers._
 import org.scalatra.Ok
 import org.scalatra.forms._
 
@@ -64,7 +65,12 @@ trait IndexControllerBase extends ControllerBase {
         val visibleOwnerSet: Set[String] = Set(account.userName) ++ getGroupsByUserName(account.userName)
         gitbucket.core.html.index(
           getRecentActivitiesByOwners(visibleOwnerSet),
-          getVisibleRepositories(Some(account), withoutPhysicalInfo = true),
+          getVisibleRepositories(
+            Some(account),
+            None,
+            withoutPhysicalInfo = true,
+            limit = context.settings.limitVisibleRepositories
+          ),
           showBannerToCreatePersonalAccessToken = hasAccountFederation(account.userName) && !hasAccessToken(
             account.userName
           )
@@ -82,7 +88,7 @@ trait IndexControllerBase extends ControllerBase {
   get("/signin") {
     val redirect = params.get("redirect")
     if (redirect.isDefined && redirect.get.startsWith("/")) {
-      flash += Keys.Flash.Redirect -> redirect.get
+      flash.update(Keys.Flash.Redirect, redirect.get)
     }
     gitbucket.core.html.signin(flash.get("userName"), flash.get("password"), flash.get("error"))
   }
@@ -95,9 +101,9 @@ trait IndexControllerBase extends ControllerBase {
           case _                         => signin(account)
         }
       case None =>
-        flash += "userName" -> form.userName
-        flash += "password" -> form.password
-        flash += "error" -> "Sorry, your Username and/or Password is incorrect. Please try again."
+        flash.update("userName", form.userName)
+        flash.update("password", form.password)
+        flash.update("error", "Sorry, your Username and/or Password is incorrect. Please try again.")
         redirect("/signin")
     }
   }
@@ -131,15 +137,15 @@ trait IndexControllerBase extends ControllerBase {
       val redirectURI = new URI(s"$baseUrl/signin/oidc")
       session.get(Keys.Session.OidcContext) match {
         case Some(context: OidcContext) =>
-          authenticate(params, redirectURI, context.state, context.nonce, oidc) map { account =>
+          authenticate(params.toMap, redirectURI, context.state, context.nonce, oidc).map { account =>
             signin(account, context.redirectBackURI)
           } orElse {
-            flash += "error" -> "Sorry, authentication failed. Please try again."
+            flash.update("error", "Sorry, authentication failed. Please try again.")
             session.invalidate()
             redirect("/signin")
           }
         case _ =>
-          flash += "error" -> "Sorry, something wrong. Please try again."
+          flash.update("error", "Sorry, something wrong. Please try again.")
           session.invalidate()
           redirect("/signin")
       }
@@ -206,7 +212,8 @@ trait IndexControllerBase extends ControllerBase {
             }
             .map { t =>
               Map(
-                "label" -> s"<b>@${StringUtil.escapeHtml(t.userName)}</b> ${StringUtil.escapeHtml(t.fullName)}",
+                "label" -> s"${avatar(t.userName, 16)}<b>@${StringUtil.escapeHtml(t.userName)}</b> ${StringUtil
+                  .escapeHtml(t.fullName)}",
                 "value" -> t.userName
               )
             }
@@ -225,7 +232,7 @@ trait IndexControllerBase extends ControllerBase {
     } getOrElse ""
   })
 
-  // TODO Move to RepositoryViwerController?
+  // TODO Move to RepositoryViewrController?
   get("/:owner/:repository/search")(referrersOnly { repository =>
     defining(params.getOrElse("q", "").trim, params.getOrElse("type", "code")) {
       case (query, target) =>
@@ -277,11 +284,28 @@ trait IndexControllerBase extends ControllerBase {
   get("/search") {
     val query = params.getOrElse("query", "").trim.toLowerCase
     val visibleRepositories =
-      getVisibleRepositories(context.loginAccount, repositoryUserName = None, withoutPhysicalInfo = true)
-    val repositories = visibleRepositories.filter { repository =>
+      getVisibleRepositories(
+        context.loginAccount,
+        None,
+        withoutPhysicalInfo = true,
+        limit = context.settings.limitVisibleRepositories
+      )
+
+    val repositories = {
+      context.settings.limitVisibleRepositories match {
+        case true =>
+          getVisibleRepositories(
+            context.loginAccount,
+            None,
+            withoutPhysicalInfo = true,
+            limit = false
+          )
+        case false => visibleRepositories
+      }
+    }.filter { repository =>
       repository.name.toLowerCase.indexOf(query) >= 0 || repository.owner.toLowerCase.indexOf(query) >= 0
     }
+
     gitbucket.core.search.html.repositories(query, repositories, visibleRepositories)
   }
-
 }

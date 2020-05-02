@@ -8,6 +8,7 @@ import gitbucket.core.service.SystemSettingsService._
 import gitbucket.core.util.ConfigUtil._
 import gitbucket.core.util.Directory._
 import gitbucket.core.util.SyntaxSugars._
+import scala.util.Using
 
 trait SystemSettingsService {
 
@@ -23,6 +24,7 @@ trait SystemSettingsService {
       props.setProperty(Gravatar, settings.gravatar.toString)
       props.setProperty(Notification, settings.notification.toString)
       settings.activityLogLimit.foreach(x => props.setProperty(ActivityLogLimit, x.toString))
+      props.setProperty(LimitVisibleRepositories, settings.limitVisibleRepositories.toString)
       props.setProperty(SshEnabled, settings.ssh.enabled.toString)
       settings.ssh.sshHost.foreach(x => props.setProperty(SshHost, x.trim))
       settings.ssh.sshPort.foreach(x => props.setProperty(SshPort, x.toString))
@@ -69,19 +71,14 @@ trait SystemSettingsService {
       }
       props.setProperty(SkinName, settings.skinName.toString)
       props.setProperty(ShowMailAddress, settings.showMailAddress.toString)
-      props.setProperty(PluginNetworkInstall, settings.pluginNetworkInstall.toString)
-      settings.pluginProxy.foreach { proxy =>
-        props.setProperty(PluginProxyHost, proxy.host)
-        props.setProperty(PluginProxyPort, proxy.port.toString)
-        proxy.user.foreach { user =>
-          props.setProperty(PluginProxyUser, user)
-        }
-        proxy.password.foreach { password =>
-          props.setProperty(PluginProxyPassword, password)
-        }
-      }
+      props.setProperty(WebHookBlockPrivateAddress, settings.webHook.blockPrivateAddress.toString)
+      props.setProperty(WebHookWhitelist, settings.webHook.whitelist.mkString("\n"))
+      props.setProperty(UploadMaxFileSize, settings.upload.maxFileSize.toString)
+      props.setProperty(UploadTimeout, settings.upload.timeout.toString)
+      props.setProperty(UploadLargeMaxFileSize, settings.upload.largeMaxFileSize.toString)
+      props.setProperty(UploadLargeTimeout, settings.upload.largeTimeout.toString)
 
-      using(new java.io.FileOutputStream(GitBucketConf)) { out =>
+      Using.resource(new java.io.FileOutputStream(GitBucketConf)) { out =>
         props.store(out, null)
       }
     }
@@ -90,7 +87,7 @@ trait SystemSettingsService {
   def loadSystemSettings(): SystemSettings = {
     defining(new java.util.Properties()) { props =>
       if (GitBucketConf.exists) {
-        using(new java.io.FileInputStream(GitBucketConf)) { in =>
+        Using.resource(new java.io.FileInputStream(GitBucketConf)) { in =>
           props.load(in)
         }
       }
@@ -103,6 +100,7 @@ trait SystemSettingsService {
         getValue(props, Gravatar, false),
         getValue(props, Notification, false),
         getOptionValue[Int](props, ActivityLogLimit, None),
+        getValue(props, LimitVisibleRepositories, false),
         Ssh(
           getValue(props, SshEnabled, false),
           getOptionValue[String](props, SshHost, None).map(_.trim),
@@ -157,17 +155,13 @@ trait SystemSettingsService {
         },
         getValue(props, SkinName, "skin-blue"),
         getValue(props, ShowMailAddress, false),
-        getValue(props, PluginNetworkInstall, false),
-        if (getValue(props, PluginProxyHost, "").nonEmpty) {
-          Some(
-            Proxy(
-              getValue(props, PluginProxyHost, ""),
-              getValue(props, PluginProxyPort, 8080),
-              getOptionValue(props, PluginProxyUser, None),
-              getOptionValue(props, PluginProxyPassword, None)
-            )
-          )
-        } else None
+        WebHook(getValue(props, WebHookBlockPrivateAddress, false), getSeqValue(props, WebHookWhitelist, "")),
+        Upload(
+          getValue(props, UploadMaxFileSize, 3 * 1024 * 1024),
+          getValue(props, UploadTimeout, 3 * 10000),
+          getValue(props, UploadLargeMaxFileSize, 3 * 1024 * 1024),
+          getValue(props, UploadLargeTimeout, 3 * 10000)
+        )
       )
     }
   }
@@ -188,6 +182,7 @@ object SystemSettingsService {
     gravatar: Boolean,
     notification: Boolean,
     activityLogLimit: Option[Int],
+    limitVisibleRepositories: Boolean,
     ssh: Ssh,
     useSMTP: Boolean,
     smtp: Option[Smtp],
@@ -197,8 +192,8 @@ object SystemSettingsService {
     oidc: Option[OIDC],
     skinName: String,
     showMailAddress: Boolean,
-    pluginNetworkInstall: Boolean,
-    pluginProxy: Option[Proxy]
+    webHook: WebHook,
+    upload: Upload
   ) {
 
     def baseUrl(request: HttpServletRequest): String =
@@ -275,7 +270,9 @@ object SystemSettingsService {
 
   case class SshAddress(host: String, port: Int, genericUser: String)
 
-  case class Lfs(serverUrl: Option[String])
+  case class WebHook(blockPrivateAddress: Boolean, whitelist: Seq[String])
+
+  case class Upload(maxFileSize: Long, timeout: Long, largeMaxFileSize: Long, largeTimeout: Long)
 
   val DefaultSshPort = 29418
   val DefaultSmtpPort = 25
@@ -289,6 +286,7 @@ object SystemSettingsService {
   private val Gravatar = "gravatar"
   private val Notification = "notification"
   private val ActivityLogLimit = "activity_log_limit"
+  private val LimitVisibleRepositories = "limitVisibleRepositories"
   private val SshEnabled = "ssh"
   private val SshHost = "ssh.host"
   private val SshPort = "ssh.port"
@@ -321,14 +319,15 @@ object SystemSettingsService {
   private val OidcJwsAlgorithm = "oidc.jws_algorithm"
   private val SkinName = "skinName"
   private val ShowMailAddress = "showMailAddress"
-  private val PluginNetworkInstall = "plugin.networkInstall"
-  private val PluginProxyHost = "plugin.proxy.host"
-  private val PluginProxyPort = "plugin.proxy.port"
-  private val PluginProxyUser = "plugin.proxy.user"
-  private val PluginProxyPassword = "plugin.proxy.password"
+  private val WebHookBlockPrivateAddress = "webhook.block_private_address"
+  private val WebHookWhitelist = "webhook.whitelist"
+  private val UploadMaxFileSize = "upload.maxFileSize"
+  private val UploadTimeout = "upload.timeout"
+  private val UploadLargeMaxFileSize = "upload.largeMaxFileSize"
+  private val UploadLargeTimeout = "upload.largeTimeout"
 
   private def getValue[A: ClassTag](props: java.util.Properties, key: String, default: A): A = {
-    getSystemProperty(key).getOrElse(getEnvironmentVariable(key).getOrElse {
+    getConfigValue(key).getOrElse {
       defining(props.getProperty(key)) { value =>
         if (value == null || value.isEmpty) {
           default
@@ -336,11 +335,21 @@ object SystemSettingsService {
           convertType(value).asInstanceOf[A]
         }
       }
-    })
+    }
+  }
+
+  private def getSeqValue[A: ClassTag](props: java.util.Properties, key: String, default: A): Seq[A] = {
+    getValue[String](props, key, "").split("\n").toIndexedSeq.map { value =>
+      if (value == null || value.isEmpty) {
+        default
+      } else {
+        convertType(value).asInstanceOf[A]
+      }
+    }
   }
 
   private def getOptionValue[A: ClassTag](props: java.util.Properties, key: String, default: Option[A]): Option[A] = {
-    getSystemProperty(key).orElse(getEnvironmentVariable(key).orElse {
+    getConfigValue(key).orElse {
       defining(props.getProperty(key)) { value =>
         if (value == null || value.isEmpty) {
           default
@@ -348,7 +357,7 @@ object SystemSettingsService {
           Some(convertType(value)).asInstanceOf[Option[A]]
         }
       }
-    })
+    }
   }
 
 }

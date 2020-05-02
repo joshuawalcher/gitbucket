@@ -1,8 +1,8 @@
 language: scala
 sudo: true
-jdk: 
-  - oraclejdk8
-  - oraclejdk11
+jdk:
+  - openjdk8
+  - openjdk11
 script:
   - sbt scalafmtSbtCheck scalafmtCheck test:scalafmtCheck test
 before_script:
@@ -15,5 +15,3 @@ cache:
     - $HOME/.sbt/boot
     - $HOME/.sbt/launchers
     - $HOME/.coursier
-    - $HOME/.embedmysql
-    - $HOME/.embedpostgresql

@@ -2,14 +2,16 @@ package gitbucket.core.controller
 
 import java.io.File
 
-import gitbucket.core.service.{AccountService, ActivityService, ReleaseService, RepositoryService}
-import gitbucket.core.util.{FileUtil, ReadableUsersAuthenticator, ReferrerAuthenticator, WritableUsersAuthenticator}
+import gitbucket.core.service.{AccountService, ActivityService, PaginationHelper, ReleaseService, RepositoryService}
+import gitbucket.core.util._
 import gitbucket.core.util.Directory._
 import gitbucket.core.util.Implicits._
 import org.scalatra.forms._
 import gitbucket.core.releases.html
 import org.apache.commons.io.FileUtils
-import scala.collection.JavaConverters._
+import org.eclipse.jgit.api.Git
+
+import scala.util.Using
 
 class ReleaseController
     extends ReleaseControllerBase
@@ -41,17 +43,14 @@ trait ReleaseControllerBase extends ControllerBase {
   )(ReleaseForm.apply)
 
   get("/:owner/:repository/releases")(referrersOnly { repository =>
-    val releases = getReleases(repository.owner, repository.name)
-    val assets = getReleaseAssetsMap(repository.owner, repository.name)
+    val page = PaginationHelper.page(params.get("page"))
 
     html.list(
       repository,
-      repository.tags.reverse.map { tag =>
-        (tag, releases.find(_.tag == tag.name).map { release =>
-          (release, assets(release))
-        })
-      },
-      hasDeveloperRole(repository.owner, repository.name, context.loginAccount)
+      fetchReleases(repository, page),
+      hasDeveloperRole(repository.owner, repository.name, context.loginAccount),
+      page,
+      repository.tags.size
     )
   })
 
@@ -87,10 +86,12 @@ trait ReleaseControllerBase extends ControllerBase {
 
   get("/:owner/:repository/releases/:tag/create")(writableUsersOnly { repository =>
     val tagName = params("tag")
+    val previousTags = repository.tags.takeWhile(_.name != tagName).reverse
+
     repository.tags
       .find(_.name == tagName)
       .map { tag =>
-        html.form(repository, tag, None)
+        html.form(repository, tag, previousTags.map(_.name), tag.message, None)
       }
       .getOrElse(NotFound())
   })
@@ -103,7 +104,7 @@ trait ReleaseControllerBase extends ControllerBase {
     createRelease(repository.owner, repository.name, form.name, form.content, tagName, loginAccount)
 
     // Insert into RELEASE_ASSET
-    val files = params.collect {
+    val files = params.toMap.collect {
       case (name, value) if name.startsWith("file:") =>
         val Array(_, fileId) = name.split(":")
         (fileId, value)
@@ -118,19 +119,42 @@ trait ReleaseControllerBase extends ControllerBase {
         createReleaseAsset(repository.owner, repository.name, tagName, fileId, fileName, size, loginAccount)
     }
 
-    recordReleaseActivity(repository.owner, repository.name, loginAccount.userName, form.name)
+    recordReleaseActivity(repository.owner, repository.name, loginAccount.userName, form.name, tagName)
 
     redirect(s"/${repository.owner}/${repository.name}/releases/${tagName}")
   })
 
+  get("/:owner/:repository/changelog/*...*")(writableUsersOnly { repository =>
+    val Seq(previousTag, currentTag) = multiParams("splat")
+    val previousTagId = repository.tags.collectFirst { case x if x.name == previousTag => x.id }.getOrElse("")
+
+    val commitLog = Using.resource(Git.open(getRepositoryDir(repository.owner, repository.name))) { git =>
+      val commits = JGitUtil.getCommitLog(git, previousTagId, currentTag).reverse
+      commits
+        .map { commit =>
+          s"- ${commit.shortMessage} ${commit.id}"
+        }
+        .mkString("\n")
+    }
+
+    commitLog
+  })
+
   get("/:owner/:repository/releases/:tag/edit")(writableUsersOnly { repository =>
     val tagName = params("tag")
+    val previousTags = repository.tags.takeWhile(_.name != tagName).reverse
 
     (for {
       release <- getRelease(repository.owner, repository.name, tagName)
       tag <- repository.tags.find(_.name == tagName)
     } yield {
-      html.form(repository, tag, Some(release, getReleaseAssets(repository.owner, repository.name, tagName)))
+      html.form(
+        repository,
+        tag,
+        previousTags.map(_.name),
+        release.content.getOrElse(""),
+        Some(release, getReleaseAssets(repository.owner, repository.name, tagName))
+      )
     }).getOrElse(NotFound())
   })
 
@@ -148,7 +172,7 @@ trait ReleaseControllerBase extends ControllerBase {
           val assets = getReleaseAssets(repository.owner, repository.name, tagName)
           deleteReleaseAssets(repository.owner, repository.name, tagName)
 
-          val files = params.collect {
+          val files = params.toMap.collect {
             case (name, value) if name.startsWith("file:") =>
               val Array(_, fileId) = name.split(":")
               (fileId, value)
@@ -189,4 +213,21 @@ trait ReleaseControllerBase extends ControllerBase {
     redirect(s"/${repository.owner}/${repository.name}/releases")
   })
 
+  private def fetchReleases(repository: RepositoryService.RepositoryInfo, page: Int) = {
+
+    import gitbucket.core.service.ReleaseService._
+
+    val (offset, limit) = ((page - 1) * ReleaseLimit, ReleaseLimit)
+    val tagsToDisplay = repository.tags.reverse.slice(offset, offset + limit)
+
+    val releases = getReleases(repository.owner, repository.name, tagsToDisplay)
+    val assets = getReleaseAssetsMap(repository.owner, repository.name, releases)
+
+    val tagsWithReleases = tagsToDisplay.map { tag =>
+      (tag, releases.find(_.tag == tag.name).map { release =>
+        (release, assets(release))
+      })
+    }
+    tagsWithReleases
+  }
 }
